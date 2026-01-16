@@ -359,7 +359,9 @@ function translateChatToResponses(chatResponse, responsesRequest, ids, allowTool
   if (reasoningText) {
     content.push({ type: 'reasoning_text', text: reasoningText, annotations: [] });
   }
-  content.push({ type: 'output_text', text: outputText, annotations: [] });
+  if (outputText) {
+    content.push({ type: 'output_text', text: outputText, annotations: [] });
+  }
 
   const msgItem = {
     id: msgId,
@@ -369,11 +371,16 @@ function translateChatToResponses(chatResponse, responsesRequest, ids, allowTool
     content,
   };
 
-  // Build output array: message item + any function_call items
-  const finalOutput = [msgItem];
+  // Build output array: message item (if any) + any function_call items
+  const finalOutput = [];
+
+  const hasToolCalls = allowTools && msg.tool_calls && Array.isArray(msg.tool_calls);
+  if (content.length > 0 || !hasToolCalls) {
+    finalOutput.push(msgItem);
+  }
 
   // Handle tool_calls (only if allowTools)
-  if (allowTools && msg.tool_calls && Array.isArray(msg.tool_calls)) {
+  if (hasToolCalls) {
     for (const tc of msg.tool_calls) {
       const callId = tc.id || `call_${randomUUID().replace(/-/g, '')}`;
       const name = tc.function?.name || '';
@@ -517,13 +524,8 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     item: msgItemInProgress,
   });
 
-  sse({
-    type: 'response.content_part.added',
-    item_id: msgId,
-    output_index: OUTPUT_INDEX,
-    content_index: CONTENT_INDEX,
-    part: { type: 'output_text', text: '', annotations: [] },
-  });
+  // content_part.added emitted only if we receive output_text
+  let contentPartAdded = false;
 
   let out = '';
   let reasoning = '';
@@ -688,6 +690,16 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
         }
 
         if (typeof delta.content === 'string' && delta.content.length) {
+          if (!contentPartAdded) {
+            sse({
+              type: 'response.content_part.added',
+              item_id: msgId,
+              output_index: OUTPUT_INDEX,
+              content_index: CONTENT_INDEX,
+              part: { type: 'output_text', text: '', annotations: [] },
+            });
+            contentPartAdded = true;
+          }
           out += delta.content;
           sse({
             type: 'response.output_text.delta',
@@ -712,28 +724,40 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     });
   }
 
-  sse({
-    type: 'response.output_text.done',
-    item_id: msgId,
-    output_index: OUTPUT_INDEX,
-    content_index: CONTENT_INDEX,
-    text: out,
-  });
+  if (out.length) {
+    sse({
+      type: 'response.output_text.done',
+      item_id: msgId,
+      output_index: OUTPUT_INDEX,
+      content_index: CONTENT_INDEX,
+      text: out,
+    });
 
-  sse({
-    type: 'response.content_part.done',
-    item_id: msgId,
-    output_index: OUTPUT_INDEX,
-    content_index: CONTENT_INDEX,
-    part: { type: 'output_text', text: out, annotations: [] },
-  });
+    if (contentPartAdded) {
+      sse({
+        type: 'response.content_part.done',
+        item_id: msgId,
+        output_index: OUTPUT_INDEX,
+        content_index: CONTENT_INDEX,
+        part: { type: 'output_text', text: out, annotations: [] },
+      });
+    }
+  }
+
+  const msgContent = [];
+  if (reasoning.length) {
+    msgContent.push({ type: 'reasoning_text', text: reasoning, annotations: [] });
+  }
+  if (out.length) {
+    msgContent.push({ type: 'output_text', text: out, annotations: [] });
+  }
 
   const msgItemDone = {
     id: msgId,
     type: 'message',
     status: 'completed',
     role: 'assistant',
-    content: [{ type: 'output_text', text: out, annotations: [] }],
+    content: msgContent,
   };
 
   sse({
@@ -742,8 +766,11 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     item: msgItemDone,
   });
 
-  // Build final output array: message item + any function_call items
-  const finalOutput = [msgItemDone];
+  // Build final output array: message item (if any) + any function_call items
+  const finalOutput = [];
+  if (msgContent.length > 0 || toolCallsMap.size === 0) {
+    finalOutput.push(msgItemDone);
+  }
   if (allowTools && toolCallsMap.size > 0) {
     const ordered = Array.from(toolCallsMap.entries()).sort((a, b) => a[0] - b[0]);
     for (const [, tcData] of ordered) {
