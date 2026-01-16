@@ -130,7 +130,7 @@ function summarizeTools(tools, limit = 8) {
     types[type] = (types[type] || 0) + 1;
     if (names.length < limit) {
       if (type === 'function') {
-        names.push(tool?.function?.name || '(missing_name)');
+        names.push(tool?.function?.name || tool?.name || '(missing_name)');
       } else {
         names.push(type);
       }
@@ -530,7 +530,9 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
 
   // Tool call tracking (only if allowTools)
   const toolCallsMap = new Map(); // index -> { callId, name, outputIndex, arguments, partialArgs }
+  const toolCallsById = new Map(); // callId -> index
   const TOOL_BASE_INDEX = 1; // After message item
+  let nextToolIndex = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -563,12 +565,22 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
         // Handle tool_calls (only if allowTools)
         if (allowTools && delta.tool_calls && Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
-            const index = tc.index;
-            if (index == null) continue;
+            let index = tc.index;
+            const tcId = tc.id;
+
+            if (index == null) {
+              if (tcId && toolCallsById.has(tcId)) {
+                index = toolCallsById.get(tcId);
+              } else {
+                index = nextToolIndex++;
+              }
+            } else if (index >= nextToolIndex) {
+              nextToolIndex = index + 1;
+            }
 
             if (!toolCallsMap.has(index)) {
               // New tool call - send output_item.added
-              const callId = tc.id || `call_${randomUUID().replace(/-/g, '')}`;
+              const callId = tcId || `call_${randomUUID().replace(/-/g, '')}`;
               const name = tc.function?.name || '';
               const outputIndex = TOOL_BASE_INDEX + index;
 
@@ -579,6 +591,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
                 arguments: '',
                 partialArgs: ''
               });
+              if (callId) toolCallsById.set(callId, index);
 
               const fnItemInProgress = {
                 id: callId,
