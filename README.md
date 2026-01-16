@@ -275,7 +275,7 @@ codex-with-zai -m "GLM-4.7"
 This repo includes end-to-end validation assets for running Codex through the proxy:
 
 - **Test suite:** [`CODEX_TEST_SUITE.md`](./CODEX_TEST_SUITE.md)
-- **Latest report:** [`CODEX_REPORT_v0.4.6.md`](./CODEX_REPORT_v0.4.6.md)
+- **Latest report:** [`CODEX_REPORT_v0.4.7.md`](./CODEX_REPORT_v0.4.7.md)
 
 Notes:
 - Interactive runs require a real TTY (`codex`).
