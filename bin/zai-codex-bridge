@@ -1,0 +1,129 @@
+#!/usr/bin/env node
+
+/**
+ * zai-codex-bridge CLI
+ *
+ * Usage: zai-codex-bridge [options]
+ *
+ * Options:
+ *   --port <number>     Port to listen on (default: 31415)
+ *   --host <string>     Host to bind to (default: 127.0.0.1)
+ *   --zai-base-url <url>  Z.AI base URL (default: https://api.z.ai/api/coding/paas/v4)
+ *   --log-level <level>  Log level: debug|info (default: info)
+ *   -h, --help          Show this help
+ */
+
+const path = require('path');
+const fs = require('fs');
+
+// Parse CLI arguments
+function parseArgs(argv) {
+  const args = {
+    port: null,
+    host: null,
+    zaiBaseUrl: null,
+    logLevel: null,
+    help: false
+  };
+
+  for (let i = 2; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (arg === '-h' || arg === '--help') {
+      args.help = true;
+      continue;
+    }
+
+    if (arg === '--port' && i + 1 < argv.length) {
+      args.port = parseInt(argv[++i], 10);
+      continue;
+    }
+
+    if (arg === '--host' && i + 1 < argv.length) {
+      args.host = argv[++i];
+      continue;
+    }
+
+    if (arg === '--zai-base-url' && i + 1 < argv.length) {
+      args.zaiBaseUrl = argv[++i];
+      continue;
+    }
+
+    if (arg === '--log-level' && i + 1 < argv.length) {
+      args.logLevel = argv[++i];
+      continue;
+    }
+  }
+
+  return args;
+}
+
+// Show help
+function showHelp() {
+  console.log(`
+zai-codex-bridge - Proxy for Codex to use Z.AI GLM models
+
+USAGE:
+  zai-codex-bridge [options]
+
+OPTIONS:
+  --port <number>         Port to listen on (default: 31415)
+  --host <string>         Host to bind to (default: 127.0.0.1)
+  --zai-base-url <url>    Z.AI base URL
+                          (default: https://api.z.ai/api/coding/paas/v4)
+  --log-level <level>     Log level: debug|info (default: info)
+  -h, --help              Show this help
+
+ENVIRONMENT VARIABLES:
+  PORT                    Override default port
+  HOST                    Override default host
+  ZAI_BASE_URL           Override Z.AI base URL
+  LOG_LEVEL              Override log level
+
+EXAMPLES:
+  # Start with defaults
+  zai-codex-bridge
+
+  # Start on custom port
+  zai-codex-bridge --port 8080
+
+  # Enable debug logging
+  zai-codex-bridge --log-level debug
+
+  # Point to different Z.AI endpoint
+  zai-codex-bridge --zai-base-url https://custom.z.ai/v1
+
+HEALTH CHECK:
+  curl http://127.0.0.1:31415/health
+
+For more information, see: https://github.com/mmmbuto/zai-codex-bridge
+`);
+}
+
+// Main
+function main() {
+  const args = parseArgs(process.argv);
+
+  if (args.help) {
+    showHelp();
+    process.exit(0);
+  }
+
+  // Set environment variables from CLI args
+  if (args.port) process.env.PORT = String(args.port);
+  if (args.host) process.env.HOST = args.host;
+  if (args.zaiBaseUrl) process.env.ZAI_BASE_URL = args.zaiBaseUrl;
+  if (args.logLevel) process.env.LOG_LEVEL = args.logLevel;
+
+  // Start the server
+  const serverPath = path.join(__dirname, '..', 'src', 'server.js');
+
+  if (!fs.existsSync(serverPath)) {
+    console.error('Error: server.js not found at', serverPath);
+    process.exit(1);
+  }
+
+  require(serverPath);
+}
+
+main();
