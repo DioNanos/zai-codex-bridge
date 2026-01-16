@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-01-16
+
+### Added
+- Auto-enable tool bridging when tool-related fields are present in the request
+- Extra logging to surface `allowTools` and `toolsPresent` per request
+- Debug tool summary logging (types and sample names)
+
+### Fixed
+- Correct output_index mapping for streaming tool call events
+- Filter non-function tools to avoid upstream schema errors
+
+### Changed
+- README guidance for MCP/tools troubleshooting and proxy startup
+
 ## [0.4.2] - 2026-01-16
 
 ### Changed

@@ -99,7 +99,8 @@ Codex tool-calling / MCP memory requires an additional compatibility layer:
 - Codex uses **Responses API tool events** (function call items + arguments delta/done, plus function_call_output inputs)
 - Some upstream models/providers may not emit tool calls (or may emit them in a different shape)
 
-This proxy can **attempt** to bridge tools when enabled:
+This proxy can **attempt** to bridge tools automatically when the request carries tool definitions
+(`tools`, `tool_choice`, or tool outputs). You can also force it on:
 
 ```bash
 export ALLOW_TOOLS=1
@@ -111,6 +112,7 @@ Important:
   - Responses `tools` + `tool_choice` → Chat `tools` + `tool_choice`
   - Chat `tool_calls` (stream/non-stream) → Responses function-call events
   - Responses `function_call_output` → Chat `role=tool` messages
+- Non-function tool types are dropped for Z.AI compatibility.
 
 (See repo changelog and docs for the exact implemented behavior.)
 
@@ -144,7 +146,8 @@ export ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4
 export LOG_LEVEL=info
 
 # Optional
-export ALLOW_TOOLS=1
+export ALLOW_TOOLS=1   # force tool bridging (otherwise auto-enabled when tools are present)
+export ALLOW_SYSTEM=1  # only if your provider supports system role
 ```
 
 ---
@@ -161,7 +164,7 @@ codex-with-zai() {
   local PROXY_PID=""
 
   if ! curl -fsS "$HEALTH" >/dev/null 2>&1; then
-    zai-codex-bridge --host "$HOST" --port "$PORT" >/dev/null 2>&1 &
+    ALLOW_TOOLS=1 zai-codex-bridge --host "$HOST" --port "$PORT" >/dev/null 2>&1 &
     PROXY_PID=$!
     trap 'kill $PROXY_PID 2>/dev/null' EXIT INT TERM
     sleep 1
@@ -240,6 +243,13 @@ codex-with-zai -m "GLM-4.7"
 ### 404 on `/v1/responses`
 - Ensure `base_url` points to the proxy root (example: `http://127.0.0.1:31415`).
 - Confirm the proxy is running and `/health` returns `ok`.
+
+### MCP/tools not being called
+- Check proxy logs for `allowTools: true` and `toolsPresent: true`.
+- If `toolsPresent: false`, Codex did not send tool definitions (verify your provider config).
+- If tools are present but the model prints literal `<function=...>` markup or never emits tool calls,
+  your upstream model likely doesn’t support tool calling.
+- If your provider supports `system` role, try `ALLOW_SYSTEM=1` to improve tool adherence.
 
 ### 502 Bad Gateway
 - Proxy reached upstream but upstream failed. Enable debug:

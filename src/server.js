@@ -22,7 +22,7 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'glm-4.7';
 
 // Env toggles for compatibility
 const ALLOW_SYSTEM = process.env.ALLOW_SYSTEM === '1';
-const ALLOW_TOOLS = process.env.ALLOW_TOOLS === '1';
+const ALLOW_TOOLS_ENV = process.env.ALLOW_TOOLS === '1';
 
 function nowSec() {
   return Math.floor(Date.now() / 1000);
@@ -91,6 +91,67 @@ function detectFormat(body) {
 }
 
 /**
+ * Detect if request carries tool-related data
+ */
+function requestHasTools(request) {
+  if (!request || typeof request !== 'object') return false;
+
+  if (Array.isArray(request.tools) && request.tools.length > 0) return true;
+  if (request.tool_choice) return true;
+
+  if (Array.isArray(request.input)) {
+    for (const item of request.input) {
+      if (!item) continue;
+      if (item.type === 'function_call_output') return true;
+      if (Array.isArray(item.tool_calls) && item.tool_calls.length > 0) return true;
+      if (item.tool_call_id) return true;
+    }
+  }
+
+  if (Array.isArray(request.messages)) {
+    for (const msg of request.messages) {
+      if (!msg) continue;
+      if (msg.role === 'tool') return true;
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+      if (msg.tool_call_id) return true;
+    }
+  }
+
+  return false;
+}
+
+function summarizeTools(tools, limit = 8) {
+  if (!Array.isArray(tools)) return null;
+  const types = {};
+  const names = [];
+
+  for (const tool of tools) {
+    const type = tool?.type || 'unknown';
+    types[type] = (types[type] || 0) + 1;
+    if (names.length < limit) {
+      if (type === 'function') {
+        names.push(tool?.function?.name || '(missing_name)');
+      } else {
+        names.push(type);
+      }
+    }
+  }
+
+  return { count: tools.length, types, sample_names: names };
+}
+
+function summarizeToolShape(tool) {
+  if (!tool || typeof tool !== 'object') return null;
+  return {
+    keys: Object.keys(tool),
+    type: tool.type,
+    name: tool.name,
+    functionKeys: tool.function && typeof tool.function === 'object' ? Object.keys(tool.function) : null,
+    functionName: tool.function?.name
+  };
+}
+
+/**
  * Flatten content parts to string - supports text, input_text, output_text
  */
 function flattenContent(content) {
@@ -113,7 +174,7 @@ function flattenContent(content) {
 /**
  * Translate Responses format to Chat Completions format
  */
-function translateResponsesToChat(request) {
+function translateResponsesToChat(request, allowTools) {
   const messages = [];
 
   // Add system message from instructions (with ALLOW_SYSTEM toggle)
@@ -145,8 +206,8 @@ function translateResponsesToChat(request) {
     } else if (Array.isArray(request.input)) {
       // Array of ResponseItem objects
       for (const item of request.input) {
-        // Handle function_call_output items (tool responses) - only if ALLOW_TOOLS
-        if (ALLOW_TOOLS && item.type === 'function_call_output') {
+        // Handle function_call_output items (tool responses) - only if allowTools
+        if (allowTools && item.type === 'function_call_output') {
           const toolMsg = {
             role: 'tool',
             tool_call_id: item.call_id || item.tool_call_id || '',
@@ -187,13 +248,13 @@ function translateResponsesToChat(request) {
           content: flattenContent(item.content)
         };
 
-        // Handle tool calls if present (only if ALLOW_TOOLS)
-        if (ALLOW_TOOLS && item.tool_calls && Array.isArray(item.tool_calls)) {
+        // Handle tool calls if present (only if allowTools)
+        if (allowTools && item.tool_calls && Array.isArray(item.tool_calls)) {
           msg.tool_calls = item.tool_calls;
         }
 
-        // Handle tool call ID for tool responses (only if ALLOW_TOOLS)
-        if (ALLOW_TOOLS && item.tool_call_id) {
+        // Handle tool call ID for tool responses (only if allowTools)
+        if (allowTools && item.tool_call_id) {
           msg.tool_call_id = item.tool_call_id;
         }
 
@@ -226,27 +287,49 @@ function translateResponsesToChat(request) {
     chatRequest.top_p = request.top_p;
   }
 
-  // Tools handling (only if ALLOW_TOOLS)
-  if (ALLOW_TOOLS && request.tools && Array.isArray(request.tools)) {
-    // Filter out tools with null or empty function
-    chatRequest.tools = request.tools.filter(tool => {
-      if (tool.type === 'function') {
-        // Check if function has required fields
-        return tool.function && typeof tool.function === 'object' &&
-               tool.function.name && tool.function.name.length > 0 &&
-               tool.function.parameters !== undefined && tool.function.parameters !== null;
-      }
-      // Keep non-function tools (if any)
-      return true;
-    });
+  // Tools handling (only if allowTools)
+  if (allowTools && request.tools && Array.isArray(request.tools)) {
+    const originalCount = request.tools.length;
+    const normalized = [];
+
+    for (const tool of request.tools) {
+      if (!tool || tool.type !== 'function') continue;
+      const fn = tool.function && typeof tool.function === 'object' ? tool.function : null;
+      const name = (fn?.name || tool.name || '').trim();
+      if (!name) continue;
+
+      // Prefer nested function fields, fall back to top-level ones if present
+      const description = fn?.description ?? tool.description;
+      const parameters = fn?.parameters ?? tool.parameters ?? { type: 'object', properties: {} };
+
+      const functionObj = { name, parameters };
+      if (description) functionObj.description = description;
+
+      // Send minimal tool schema for upstream compatibility
+      normalized.push({
+        type: 'function',
+        function: functionObj
+      });
+    }
+
+    chatRequest.tools = normalized;
+
+    const dropped = originalCount - chatRequest.tools.length;
+    if (dropped > 0) {
+      log('warn', `Dropped ${dropped} non-function or invalid tools for upstream compatibility`);
+    }
+
     // Only add tools array if there are valid tools
     if (chatRequest.tools.length === 0) {
       delete chatRequest.tools;
     }
   }
 
-  if (ALLOW_TOOLS && request.tool_choice) {
+  if (allowTools && request.tool_choice) {
     chatRequest.tool_choice = request.tool_choice;
+    if (!chatRequest.tools || chatRequest.tools.length === 0) {
+      delete chatRequest.tool_choice;
+    }
   }
 
   log('debug', 'Translated Responses->Chat:', {
@@ -261,9 +344,9 @@ function translateResponsesToChat(request) {
 /**
  * Translate Chat Completions response to Responses format
  * Handles both output_text and reasoning_text content
- * Handles tool_calls if present (only if ALLOW_TOOLS)
+ * Handles tool_calls if present (only if allowTools)
  */
-function translateChatToResponses(chatResponse, responsesRequest, ids) {
+function translateChatToResponses(chatResponse, responsesRequest, ids, allowTools) {
   const msg = chatResponse.choices?.[0]?.message ?? {};
   const outputText = msg.content ?? '';
   const reasoningText = msg.reasoning_content ?? '';
@@ -289,8 +372,8 @@ function translateChatToResponses(chatResponse, responsesRequest, ids) {
   // Build output array: message item + any function_call items
   const finalOutput = [msgItem];
 
-  // Handle tool_calls (only if ALLOW_TOOLS)
-  if (ALLOW_TOOLS && msg.tool_calls && Array.isArray(msg.tool_calls)) {
+  // Handle tool_calls (only if allowTools)
+  if (allowTools && msg.tool_calls && Array.isArray(msg.tool_calls)) {
     for (const tc of msg.tool_calls) {
       const callId = tc.id || `call_${randomUUID().replace(/-/g, '')}`;
       const name = tc.function?.name || '';
@@ -386,7 +469,7 @@ async function makeUpstreamRequest(path, body, headers) {
  * Handle streaming response from Z.AI with proper Responses API event format
  * Separates reasoning_content, content, and tool_calls into distinct events
  */
-async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
+async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, allowTools) {
   const decoder = new TextDecoder();
   const reader = upstreamBody.getReader();
   let buffer = '';
@@ -445,9 +528,9 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
   let out = '';
   let reasoning = '';
 
-  // Tool call tracking (only if ALLOW_TOOLS)
-  const toolCallsMap = new Map(); // index -> { callId, name, arguments, partialArgs }
-  let nextOutputIndex = 1; // After message item
+  // Tool call tracking (only if allowTools)
+  const toolCallsMap = new Map(); // index -> { callId, name, outputIndex, arguments, partialArgs }
+  const TOOL_BASE_INDEX = 1; // After message item
 
   while (true) {
     const { done, value } = await reader.read();
@@ -477,8 +560,8 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
 
         const delta = chunk.choices?.[0]?.delta || {};
 
-        // Handle tool_calls (only if ALLOW_TOOLS)
-        if (ALLOW_TOOLS && delta.tool_calls && Array.isArray(delta.tool_calls)) {
+        // Handle tool_calls (only if allowTools)
+        if (allowTools && delta.tool_calls && Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
             const index = tc.index;
             if (index == null) continue;
@@ -487,10 +570,12 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
               // New tool call - send output_item.added
               const callId = tc.id || `call_${randomUUID().replace(/-/g, '')}`;
               const name = tc.function?.name || '';
+              const outputIndex = TOOL_BASE_INDEX + index;
 
               toolCallsMap.set(index, {
                 callId,
                 name,
+                outputIndex,
                 arguments: '',
                 partialArgs: ''
               });
@@ -506,7 +591,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
 
               sse({
                 type: 'response.output_item.added',
-                output_index: nextOutputIndex,
+                output_index: outputIndex,
                 item: fnItemInProgress,
               });
 
@@ -514,7 +599,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
                 sse({
                   type: 'response.function_call_name.done',
                   item_id: callId,
-                  output_index: nextOutputIndex,
+                  output_index: outputIndex,
                   name: name,
                 });
               }
@@ -528,7 +613,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
               sse({
                 type: 'response.function_call_name.done',
                 item_id: tcData.callId,
-                output_index: OUTPUT_INDEX + index,
+                output_index: tcData.outputIndex,
                 name: tcData.name,
               });
             }
@@ -540,7 +625,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
               sse({
                 type: 'response.function_call_arguments.delta',
                 item_id: tcData.callId,
-                output_index: OUTPUT_INDEX + index,
+                output_index: tcData.outputIndex,
                 delta: tc.function.arguments,
               });
             }
@@ -553,7 +638,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
               sse({
                 type: 'response.function_call_arguments.done',
                 item_id: tcData.callId,
-                output_index: OUTPUT_INDEX + index,
+                output_index: tcData.outputIndex,
                 arguments: tcData.arguments,
               });
 
@@ -568,7 +653,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
 
               sse({
                 type: 'response.output_item.done',
-                output_index: OUTPUT_INDEX + index,
+                output_index: tcData.outputIndex,
                 item: fnItemDone,
               });
             }
@@ -646,8 +731,9 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids) {
 
   // Build final output array: message item + any function_call items
   const finalOutput = [msgItemDone];
-  if (ALLOW_TOOLS && toolCallsMap.size > 0) {
-    for (const [index, tcData] of toolCallsMap.entries()) {
+  if (allowTools && toolCallsMap.size > 0) {
+    const ordered = Array.from(toolCallsMap.entries()).sort((a, b) => a[0] - b[0]);
+    for (const [, tcData] of ordered) {
       finalOutput.push({
         id: tcData.callId,
         type: 'function_call',
@@ -707,19 +793,30 @@ async function handlePostRequest(req, res) {
     return;
   }
 
+  const hasTools = requestHasTools(request);
+  const allowTools = ALLOW_TOOLS_ENV || hasTools;
+
   log('info', 'Incoming request:', {
     path,
     format: detectFormat(request),
     model: request.model,
+    allowTools,
+    toolsPresent: hasTools,
     authHeader: req.headers['authorization'] || req.headers['Authorization'] || 'none'
   });
+  if (hasTools) {
+    log('debug', 'Tools summary:', summarizeTools(request.tools));
+    if (request.tools && request.tools[0]) {
+      log('debug', 'Tool[0] shape:', summarizeToolShape(request.tools[0]));
+    }
+  }
 
   let upstreamBody;
   const format = detectFormat(request);
 
   if (format === 'responses') {
     // Translate Responses to Chat
-    upstreamBody = translateResponsesToChat(request);
+    upstreamBody = translateResponsesToChat(request, allowTools);
   } else if (format === 'chat') {
     // Pass through Chat format
     upstreamBody = request;
@@ -769,7 +866,7 @@ async function handlePostRequest(req, res) {
       });
 
       try {
-        await streamChatToResponses(upstreamResponse.body, res, request, ids);
+        await streamChatToResponses(upstreamResponse.body, res, request, ids, allowTools);
         log('info', 'Streaming completed');
       } catch (e) {
         log('error', 'Streaming error:', e);
@@ -784,7 +881,7 @@ async function handlePostRequest(req, res) {
         msgId: `msg_${randomUUID().replace(/-/g, '')}`,
       };
 
-      const response = translateChatToResponses(chatResponse, request, ids);
+      const response = translateChatToResponses(chatResponse, request, ids, allowTools);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(response));
