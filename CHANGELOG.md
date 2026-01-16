@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Document reasoning passthrough and reasoning_text events
 - Clarify that response.completed output excludes function_call items for local tool execution
 
+### Docs
+- Document reasoning passthrough and reasoning_text events
+- Clarify that response.completed output excludes function_call items for local tool execution
+
 ## [0.4.6] - 2026-01-16
 
 ### Fixed
