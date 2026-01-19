@@ -19,6 +19,10 @@ const HOST = process.env.HOST || '127.0.0.1';
 const ZAI_BASE_URL = process.env.ZAI_BASE_URL || 'https://api.z.ai/api/coding/paas/v4';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'glm-4.7';
+const LOG_STREAM_RAW = process.env.LOG_STREAM_RAW === '1';
+const LOG_STREAM_MAX = parseInt(process.env.LOG_STREAM_MAX || '800', 10);
+const SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS = process.env.SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS === '1';
+const DEFER_OUTPUT_TEXT_UNTIL_DONE = process.env.DEFER_OUTPUT_TEXT_UNTIL_DONE === '1';
 
 // Env toggles for compatibility
 const ALLOW_SYSTEM = process.env.ALLOW_SYSTEM === '1';
@@ -182,6 +186,37 @@ function extractReasoningText(obj) {
     if (typeof val === 'string' && val.length) return val;
   }
   return '';
+}
+
+/**
+ * Compute a safe incremental delta for providers that sometimes stream
+ * the full content-so-far instead of true deltas.
+ */
+function computeDelta(prev, incoming) {
+  if (!incoming) return { delta: '', next: prev };
+  if (!prev) return { delta: incoming, next: incoming };
+
+  // Full-content streaming: incoming is the full buffer so far.
+  if (incoming.startsWith(prev)) {
+    return { delta: incoming.slice(prev.length), next: incoming };
+  }
+
+  // Duplicate chunk (provider repeated last fragment).
+  if (prev.endsWith(incoming)) {
+    return { delta: '', next: prev };
+  }
+
+  // Overlap fix: avoid duplicated boundary text.
+  const max = Math.min(prev.length, incoming.length);
+  for (let i = max; i > 0; i--) {
+    if (prev.endsWith(incoming.slice(0, i))) {
+      const delta = incoming.slice(i);
+      return { delta, next: prev + delta };
+    }
+  }
+
+  // Fallback: treat as incremental.
+  return { delta: incoming, next: prev + incoming };
 }
 
 /**
@@ -544,6 +579,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
 
   let out = '';
   let reasoning = '';
+  let sawToolCalls = false;
 
   // Tool call tracking (only if allowTools)
   const toolCallsMap = new Map(); // index -> { callId, name, outputIndex, arguments, partialArgs }
@@ -577,10 +613,18 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
           continue;
         }
 
+        if (LOG_STREAM_RAW) {
+          const preview = JSON.stringify(chunk);
+          log('debug', 'Upstream chunk:', preview.length > LOG_STREAM_MAX ? preview.slice(0, LOG_STREAM_MAX) + '…' : preview);
+        }
+
         const delta = chunk.choices?.[0]?.delta || {};
 
         // Handle tool_calls (only if allowTools)
         if (allowTools && delta.tool_calls && Array.isArray(delta.tool_calls)) {
+          if (SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS) {
+            sawToolCalls = true;
+          }
           for (const tc of delta.tool_calls) {
             let index = tc.index;
             const tcId = tc.id;
@@ -693,38 +737,51 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
         // NON mescolare reasoning in output_text
         const reasoningDelta = extractReasoningText(delta);
         if (reasoningDelta) {
-          reasoning += reasoningDelta;
-          sse({
-            type: 'response.reasoning_text.delta',
-            item_id: msgId,
-            output_index: OUTPUT_INDEX,
-            content_index: CONTENT_INDEX,
-            delta: reasoningDelta,
-          });
-        }
-
-        if (typeof delta.content === 'string' && delta.content.length) {
-          if (!contentPartAdded) {
+          const computed = computeDelta(reasoning, reasoningDelta);
+          reasoning = computed.next;
+          if (computed.delta.length) {
             sse({
-              type: 'response.content_part.added',
+              type: 'response.reasoning_text.delta',
               item_id: msgId,
               output_index: OUTPUT_INDEX,
               content_index: CONTENT_INDEX,
-              part: { type: 'output_text', text: '', annotations: [] },
+              delta: computed.delta,
             });
-            contentPartAdded = true;
           }
-          out += delta.content;
-          sse({
-            type: 'response.output_text.delta',
-            item_id: msgId,
-            output_index: OUTPUT_INDEX,
-            content_index: CONTENT_INDEX,
-            delta: delta.content,
-          });
+        }
+
+        if (typeof delta.content === 'string' && delta.content.length) {
+          const computed = computeDelta(out, delta.content);
+          out = computed.next;
+          if (!DEFER_OUTPUT_TEXT_UNTIL_DONE
+            && !(SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS && sawToolCalls)
+            && computed.delta.length) {
+            if (!contentPartAdded) {
+              sse({
+                type: 'response.content_part.added',
+                item_id: msgId,
+                output_index: OUTPUT_INDEX,
+                content_index: CONTENT_INDEX,
+                part: { type: 'output_text', text: '', annotations: [] },
+              });
+              contentPartAdded = true;
+            }
+            sse({
+              type: 'response.output_text.delta',
+              item_id: msgId,
+              output_index: OUTPUT_INDEX,
+              content_index: CONTENT_INDEX,
+              delta: computed.delta,
+            });
+          }
         }
       }
     }
+  }
+
+  const includeOutputText = out.length > 0 && !(SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS && sawToolCalls);
+  if (!includeOutputText && out.length > 0) {
+    log('info', 'Suppressing assistant output_text due to tool_calls');
   }
 
   // done events
@@ -738,7 +795,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     });
   }
 
-  if (out.length) {
+  if (includeOutputText) {
     sse({
       type: 'response.output_text.done',
       item_id: msgId,
@@ -762,7 +819,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   if (reasoning.length) {
     msgContent.push({ type: 'reasoning_text', text: reasoning, annotations: [] });
   }
-  if (out.length) {
+  if (includeOutputText) {
     msgContent.push({ type: 'output_text', text: out, annotations: [] });
   }
 

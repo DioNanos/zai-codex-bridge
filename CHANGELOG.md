@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8] - 2026-01-19
+
+### Added
+- Raw upstream chunk logging (`LOG_STREAM_RAW`) for streaming diagnostics
+- Output suppression toggles for tool-call rounds (`SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS`, `DEFER_OUTPUT_TEXT_UNTIL_DONE`)
+- Auto-update on startup (checks npm latest and installs if newer; can be disabled via config)
+
+### Fixed
+- De-duplicate streaming deltas when providers emit full-content chunks
+
 ## [0.4.7] - 2026-01-16
 
 ### Fixed

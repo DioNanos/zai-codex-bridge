@@ -15,6 +15,9 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const https = require('https');
+const { spawn } = require('child_process');
 
 // Parse CLI arguments
 function parseArgs(argv) {
@@ -100,6 +103,90 @@ For more information, see: https://github.com/mmmbuto/zai-codex-bridge
 `);
 }
 
+function readConfig() {
+  const cfgPath = process.env.ZAI_BRIDGE_CONFIG ||
+    path.join(os.homedir(), '.config', 'zai-codex-bridge', 'config.json');
+  if (!fs.existsSync(cfgPath)) return {};
+  try {
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+function semverParts(version) {
+  const match = String(version || '').trim().replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return match.slice(1, 4).map(Number);
+}
+
+function compareSemver(a, b) {
+  const pa = semverParts(a);
+  const pb = semverParts(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] > pb[i]) return 1;
+    if (pa[i] < pb[i]) return -1;
+  }
+  return 0;
+}
+
+function getJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'zai-codex-bridge' } }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+async function maybeAutoUpdate() {
+  const cfg = readConfig();
+  const disabled = cfg.auto_update === false ||
+    process.env.ZAI_BRIDGE_AUTO_UPDATE === '0' ||
+    process.env.ZAI_BRIDGE_NO_UPDATE === '1';
+  if (disabled) return;
+
+  const pkgPath = path.join(__dirname, '..', 'package.json');
+  if (!fs.existsSync(pkgPath)) return;
+  let currentVersion = null;
+  try {
+    currentVersion = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version;
+  } catch {
+    return;
+  }
+
+  let latestVersion = null;
+  try {
+    const npmMeta = await getJson('https://registry.npmjs.org/%40mmmbuto%2Fzai-codex-bridge');
+    latestVersion = npmMeta && npmMeta['dist-tags'] && npmMeta['dist-tags'].latest;
+  } catch {
+    return;
+  }
+
+  if (!latestVersion || !currentVersion) return;
+  if (compareSemver(latestVersion, currentVersion) <= 0) return;
+
+  console.error(`[INFO] update available: ${currentVersion} -> ${latestVersion}, installing...`);
+  try {
+    const child = spawn('npm', ['install', '-g', `@mmmbuto/zai-codex-bridge@${latestVersion}`], {
+      stdio: 'ignore',
+      detached: true
+    });
+    child.unref();
+  } catch {
+    // silent fail
+  }
+}
+
 // Main
 function main() {
   const args = parseArgs(process.argv);
@@ -114,6 +201,9 @@ function main() {
   if (args.host) process.env.HOST = args.host;
   if (args.zaiBaseUrl) process.env.ZAI_BASE_URL = args.zaiBaseUrl;
   if (args.logLevel) process.env.LOG_LEVEL = args.logLevel;
+
+  // Optional auto-update (non-blocking)
+  void maybeAutoUpdate();
 
   // Start the server
   const serverPath = path.join(__dirname, '..', 'src', 'server.js');
