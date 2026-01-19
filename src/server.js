@@ -540,6 +540,10 @@ function pickAuth(incomingHeaders) {
   // PRIORITY: env ZAI_API_KEY (force correct key) -> incoming header
   const envTok = (process.env.ZAI_API_KEY || '').trim();
   if (envTok) return getBearer(envTok);
+  const envTokP = (process.env.ZAI_API_KEY_P || '').trim();
+  if (envTokP) return getBearer(envTokP);
+  const envTokA = (process.env.ZAI_API_KEY_A || '').trim();
+  if (envTokA) return getBearer(envTokA);
 
   const h = (incomingHeaders['authorization'] || incomingHeaders['Authorization'] || '').trim();
   return getBearer(h);

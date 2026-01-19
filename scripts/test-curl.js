@@ -10,7 +10,11 @@ const http = require('http');
 
 const PROXY_HOST = process.env.PROXY_HOST || '127.0.0.1';
 const PROXY_PORT = process.env.PROXY_PORT || '31415';
-const ZAI_API_KEY = process.env.ZAI_API_KEY || process.env.OPENAI_API_KEY || '';
+const ZAI_API_KEY = process.env.ZAI_API_KEY
+  || process.env.ZAI_API_KEY_P
+  || process.env.ZAI_API_KEY_A
+  || process.env.OPENAI_API_KEY
+  || '';
 
 async function testHealth() {
   console.log('\n=== Testing Health Endpoint ===\n');
