@@ -580,6 +580,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   let out = '';
   let reasoning = '';
   let sawToolCalls = false;
+  let lastFinishReason = null;
 
   // Tool call tracking (only if allowTools)
   const toolCallsMap = new Map(); // index -> { callId, name, outputIndex, arguments, partialArgs }
@@ -618,7 +619,11 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
           log('debug', 'Upstream chunk:', preview.length > LOG_STREAM_MAX ? preview.slice(0, LOG_STREAM_MAX) + '…' : preview);
         }
 
-        const delta = chunk.choices?.[0]?.delta || {};
+        const choice = chunk.choices?.[0] || {};
+        const delta = choice.delta || {};
+        if (choice.finish_reason) {
+          lastFinishReason = choice.finish_reason;
+        }
 
         // Handle tool_calls (only if allowTools)
         if (allowTools && delta.tool_calls && Array.isArray(delta.tool_calls)) {
@@ -704,7 +709,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
             }
 
             // Check if this tool call is done (finish_reason comes later in the choice)
-            const finishReason = chunk.choices?.[0]?.finish_reason;
+            const finishReason = choice.finish_reason;
             if (finishReason === 'tool_calls' || (tc.function?.arguments && tc.function.arguments.length > 0 && chunk.choices?.[0]?.delta !== null)) {
               tcData.arguments = tcData.partialArgs;
 
@@ -779,9 +784,23 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     }
   }
 
-  const includeOutputText = out.length > 0 && !(SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS && sawToolCalls);
+  const suppressForTools = SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS
+    && sawToolCalls
+    && lastFinishReason === 'tool_calls';
+  const includeOutputText = out.length > 0 && !suppressForTools;
   if (!includeOutputText && out.length > 0) {
-    log('info', 'Suppressing assistant output_text due to tool_calls');
+    log('info', 'Suppressing assistant output_text due to tool_calls', { finish_reason: lastFinishReason });
+    // Route suppressed assistant text into reasoning stream so it is visible outside chat.
+    const separator = reasoning.length ? '\n\n' : '';
+    const routed = separator + out;
+    reasoning += routed;
+    sse({
+      type: 'response.reasoning_text.delta',
+      item_id: msgId,
+      output_index: OUTPUT_INDEX,
+      content_index: CONTENT_INDEX,
+      delta: routed,
+    });
   }
 
   // done events
