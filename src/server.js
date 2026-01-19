@@ -85,6 +85,7 @@ function buildResponseFailed(responseId, model, createdAt, errorCode, errorMessa
       object: 'response',
       created_at: createdAt,
       status: 'failed',
+      model: model,
       error: {
         code: errorCode,
         message: errorMessage
@@ -619,6 +620,14 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     const failedEvent = buildResponseFailed(responseId, model, createdAt, errorCode, errorMessage);
     sse(failedEvent);
     try {
+      const cancel = reader.cancel();
+      if (cancel && typeof cancel.catch === 'function') {
+        cancel.catch(() => {});
+      }
+    } catch {
+      // Ignore errors during reader cancel
+    }
+    try {
       res.end();
     } catch {
       // Ignore errors during res.end()
@@ -701,7 +710,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
           log('debug', 'Upstream chunk:', preview.length > LOG_STREAM_MAX ? preview.slice(0, LOG_STREAM_MAX) + '…' : preview);
         }
 
-      const choice = chunk.choices?.[0] || {};
+        const choice = chunk.choices?.[0] || {};
         const delta = choice.delta || {};
         const finishReason = choice.finish_reason;
 
@@ -1103,6 +1112,7 @@ async function handlePostRequest(req, res) {
           'upstream_error',
           `Upstream request failed with status ${status}: ${errorBody.substring(0, 100)}`
         );
+        failedEvent.sequence_number = 1;
         res.write(`data: ${JSON.stringify(failedEvent)}\n\n`);
         res.end();
         return;
