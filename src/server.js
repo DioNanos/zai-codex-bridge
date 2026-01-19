@@ -32,6 +32,67 @@ function nowSec() {
   return Math.floor(Date.now() / 1000);
 }
 
+/**
+ * Generate a random request ID for logging
+ */
+function generateRequestId() {
+  return `req_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+}
+
+/**
+ * Lightweight validation for Requests API format
+ * Returns { valid: boolean, errors: string[] }
+ */
+function validateRequest(request, format) {
+  const errors = [];
+
+  if (format === 'responses') {
+    if (request.instructions !== undefined && typeof request.instructions !== 'string') {
+      errors.push('instructions must be a string');
+    }
+
+    if (request.input !== undefined) {
+      if (typeof request.input !== 'string' && !Array.isArray(request.input)) {
+        errors.push('input must be a string or array');
+      }
+    }
+
+    if (request.model !== undefined && typeof request.model !== 'string') {
+      errors.push('model must be a string');
+    }
+
+    if (request.tools !== undefined) {
+      if (!Array.isArray(request.tools)) {
+        errors.push('tools must be an array');
+      }
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
+/**
+ * Build a response.failed SSE event
+ */
+function buildResponseFailed(responseId, model, createdAt, errorCode, errorMessage) {
+  return {
+    type: 'response.failed',
+    response: {
+      id: responseId,
+      object: 'response',
+      created_at: createdAt,
+      status: 'failed',
+      error: {
+        code: errorCode,
+        message: errorMessage
+      }
+    }
+  };
+}
+
 function buildResponseObject({
   id,
   model,
@@ -506,7 +567,7 @@ async function makeUpstreamRequest(path, body, headers) {
     cleanPath: cleanPath,
     base: ZAI_BASE_URL,
     auth_len: auth.length,
-    auth_prefix: auth.slice(0, 14), // "Bearer xxxxxx"
+    auth_prefix: auth.slice(0, 14) + '...', // Mask full token, keep prefix "Bearer xxxxxx..."
     bodyKeys: Object.keys(body),
     bodyPreview: JSON.stringify(body).substring(0, 800),
     messagesCount: body.messages?.length || 0,
@@ -534,14 +595,34 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   const createdAt = ids.createdAt;
   const responseId = ids.responseId;
   const msgId = ids.msgId;
+  const model = responsesRequest?.model || DEFAULT_MODEL;
 
   let seq = 1;
   const OUTPUT_INDEX = 0;
   const CONTENT_INDEX = 0;
 
+  // Track if stream has been terminated to avoid double-end
+  let streamTerminated = false;
+
   function sse(obj) {
     if (obj.sequence_number == null) obj.sequence_number = seq++;
     res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  }
+
+  /**
+   * Send response.failed SSE event and safely close the stream
+   */
+  function sendResponseFailed(errorCode, errorMessage) {
+    if (streamTerminated) return;
+    streamTerminated = true;
+
+    const failedEvent = buildResponseFailed(responseId, model, createdAt, errorCode, errorMessage);
+    sse(failedEvent);
+    try {
+      res.end();
+    } catch {
+      // Ignore errors during res.end()
+    }
   }
 
   // response.created / response.in_progress
@@ -588,7 +669,8 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   const TOOL_BASE_INDEX = 1; // After message item
   let nextToolIndex = 0;
 
-  while (true) {
+  try {
+    while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
@@ -619,10 +701,21 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
           log('debug', 'Upstream chunk:', preview.length > LOG_STREAM_MAX ? preview.slice(0, LOG_STREAM_MAX) + '…' : preview);
         }
 
-        const choice = chunk.choices?.[0] || {};
+      const choice = chunk.choices?.[0] || {};
         const delta = choice.delta || {};
-        if (choice.finish_reason) {
-          lastFinishReason = choice.finish_reason;
+        const finishReason = choice.finish_reason;
+
+        if (finishReason) {
+          lastFinishReason = finishReason;
+
+          // Handle content_filter - send response.failed and stop streaming
+          if (finishReason === 'content_filter') {
+            sendResponseFailed(
+              'content_filter',
+              'Content was filtered by upstream provider'
+            );
+            return; // Exit the loop entirely
+          }
         }
 
         // Handle tool_calls (only if allowTools)
@@ -709,7 +802,6 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
             }
 
             // Check if this tool call is done (finish_reason comes later in the choice)
-            const finishReason = choice.finish_reason;
             if (finishReason === 'tool_calls' || (tc.function?.arguments && tc.function.arguments.length > 0 && chunk.choices?.[0]?.delta !== null)) {
               tcData.arguments = tcData.partialArgs;
 
@@ -782,6 +874,17 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
         }
       }
     }
+    }
+  } catch (streamError) {
+    // Exception occurred during streaming - send response.failed
+    log('error', 'Stream exception:', streamError);
+    sendResponseFailed('stream_error', `Stream processing error: ${streamError.message}`);
+    return;
+  }
+
+  // If stream was terminated due to content_filter or error, don't send completion events
+  if (streamTerminated) {
+    return;
   }
 
   const suppressForTools = SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS
@@ -885,6 +988,10 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
 async function handlePostRequest(req, res) {
   // Use normalized pathname instead of raw req.url
   const { pathname: path } = new URL(req.url, 'http://127.0.0.1');
+  const requestId = generateRequestId();
+
+  // Log with request_id
+  log('info', `[${requestId}] Incoming ${req.method} ${path}`);
 
   // Handle both /responses and /v1/responses, /chat/completions and /v1/chat/completions
   const isResponses = (path === '/responses' || path === '/v1/responses');
@@ -905,21 +1012,36 @@ async function handlePostRequest(req, res) {
   try {
     request = JSON.parse(body);
   } catch (e) {
+    log('warn', `[${requestId}] Invalid JSON: ${e.message}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid JSON' }));
     return;
   }
 
+  // Lightweight validation for Responses format
+  const format = detectFormat(request);
+  if (format === 'responses') {
+    const validation = validateRequest(request, format);
+    if (!validation.valid) {
+      log('warn', `[${requestId}] Validation failed:`, validation.errors);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'Validation Failed',
+        details: validation.errors
+      }));
+      return;
+    }
+  }
+
   const hasTools = requestHasTools(request);
   const allowTools = ALLOW_TOOLS_ENV || hasTools;
 
-  log('info', 'Incoming request:', {
+  log('info', `[${requestId}] Request details:`, {
     path,
-    format: detectFormat(request),
+    format,
     model: request.model,
     allowTools,
-    toolsPresent: hasTools,
-    authHeader: req.headers['authorization'] || req.headers['Authorization'] || 'none'
+    toolsPresent: hasTools
   });
   if (hasTools) {
     log('debug', 'Tools summary:', summarizeTools(request.tools));
@@ -929,7 +1051,8 @@ async function handlePostRequest(req, res) {
   }
 
   let upstreamBody;
-  const format = detectFormat(request);
+
+  // format is already defined above during validation
 
   if (format === 'responses') {
     // Translate Responses to Chat
@@ -953,11 +1076,39 @@ async function handlePostRequest(req, res) {
     if (!upstreamResponse.ok) {
       const errorBody = await upstreamResponse.text();
       const status = upstreamResponse.status;
-      log('error', 'Upstream error:', {
+      log('error', `[${requestId}] Upstream error:`, {
         status: status,
         body: errorBody.substring(0, 200)
       });
 
+      // For streaming requests, send SSE response.failed
+      if (upstreamBody.stream) {
+        const ids = {
+          createdAt: nowSec(),
+          responseId: `resp_${randomUUID().replace(/-/g, '')}`,
+          msgId: `msg_${randomUUID().replace(/-/g, '')}`,
+        };
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+
+        const failedEvent = buildResponseFailed(
+          ids.responseId,
+          request.model || DEFAULT_MODEL,
+          ids.createdAt,
+          'upstream_error',
+          `Upstream request failed with status ${status}: ${errorBody.substring(0, 100)}`
+        );
+        res.write(`data: ${JSON.stringify(failedEvent)}\n\n`);
+        res.end();
+        return;
+      }
+
+      // Non-streaming: return JSON error
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         error: 'Upstream request failed',
