@@ -23,6 +23,7 @@ const LOG_STREAM_RAW = process.env.LOG_STREAM_RAW === '1';
 const LOG_STREAM_MAX = parseInt(process.env.LOG_STREAM_MAX || '800', 10);
 const SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS = process.env.SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS === '1';
 const DEFER_OUTPUT_TEXT_UNTIL_DONE = process.env.DEFER_OUTPUT_TEXT_UNTIL_DONE === '1';
+const SUPPRESS_REASONING_TEXT = process.env.SUPPRESS_REASONING_TEXT === '1';
 
 // Env toggles for compatibility
 const ALLOW_SYSTEM = process.env.ALLOW_SYSTEM === '1';
@@ -673,14 +674,41 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
 
   let out = '';
   let reasoning = '';
+  let routedOutputToReasoning = false;
   let sawToolCalls = false;
   let lastFinishReason = null;
 
   // Tool call tracking (only if allowTools)
-  const toolCallsMap = new Map(); // index -> { callId, name, outputIndex, arguments, partialArgs }
+  const toolCallsMap = new Map(); // index -> { callId, name, outputIndex, arguments, partialArgs, done }
   const toolCallsById = new Map(); // callId -> index
   const TOOL_BASE_INDEX = 1; // After message item
   let nextToolIndex = 0;
+
+  function finalizeToolCall(tcData) {
+    if (!tcData || tcData.done) return;
+    tcData.arguments = tcData.partialArgs;
+    sse({
+      type: 'response.function_call_arguments.done',
+      item_id: tcData.callId,
+      output_index: tcData.outputIndex,
+      arguments: tcData.arguments,
+    });
+
+    const fnItemDone = {
+      id: tcData.callId,
+      type: 'function_call',
+      call_id: tcData.callId,
+      name: tcData.name,
+      arguments: tcData.arguments,
+    };
+
+    sse({
+      type: 'response.output_item.done',
+      output_index: tcData.outputIndex,
+      item: fnItemDone,
+    });
+    tcData.done = true;
+  }
 
   try {
     while (true) {
@@ -761,7 +789,8 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
                 name,
                 outputIndex,
                 arguments: '',
-                partialArgs: ''
+                partialArgs: '',
+                done: false
               });
               if (callId) toolCallsById.set(callId, index);
 
@@ -815,29 +844,8 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
             }
 
             // Check if this tool call is done (finish_reason comes later in the choice)
-            if (finishReason === 'tool_calls' || (tc.function?.arguments && tc.function.arguments.length > 0 && chunk.choices?.[0]?.delta !== null)) {
-              tcData.arguments = tcData.partialArgs;
-
-              sse({
-                type: 'response.function_call_arguments.done',
-                item_id: tcData.callId,
-                output_index: tcData.outputIndex,
-                arguments: tcData.arguments,
-              });
-
-              const fnItemDone = {
-                id: tcData.callId,
-                type: 'function_call',
-                call_id: tcData.callId,
-                name: tcData.name,
-                arguments: tcData.arguments,
-              };
-
-              sse({
-                type: 'response.output_item.done',
-                output_index: tcData.outputIndex,
-                item: fnItemDone,
-              });
+            if (finishReason === 'tool_calls') {
+              finalizeToolCall(tcData);
             }
           }
           // Skip to next iteration after handling tool_calls
@@ -846,7 +854,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
 
         // NON mescolare reasoning in output_text
         const reasoningDelta = extractReasoningText(delta);
-        if (reasoningDelta) {
+        if (!SUPPRESS_REASONING_TEXT && reasoningDelta) {
           const computed = computeDelta(reasoning, reasoningDelta);
           reasoning = computed.next;
           if (computed.delta.length) {
@@ -900,27 +908,35 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     return;
   }
 
+  // Ensure any pending tool calls are finalized once at end of stream
+  if (toolCallsMap.size > 0) {
+    for (const tcData of toolCallsMap.values()) {
+      finalizeToolCall(tcData);
+    }
+  }
+
   const suppressForTools = SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS
     && sawToolCalls
     && lastFinishReason === 'tool_calls';
   const includeOutputText = out.length > 0 && !suppressForTools;
-  if (!includeOutputText && out.length > 0) {
-    log('info', 'Suppressing assistant output_text due to tool_calls', { finish_reason: lastFinishReason });
-    // Route suppressed assistant text into reasoning stream so it is visible outside chat.
-    const separator = reasoning.length ? '\n\n' : '';
-    const routed = separator + out;
-    reasoning += routed;
-    sse({
-      type: 'response.reasoning_text.delta',
-      item_id: msgId,
-      output_index: OUTPUT_INDEX,
-      content_index: CONTENT_INDEX,
-      delta: routed,
-    });
-  }
+    if (!includeOutputText && out.length > 0) {
+      log('info', 'Suppressing assistant output_text due to tool_calls', { finish_reason: lastFinishReason });
+      // Route suppressed assistant text into reasoning stream so it is visible outside chat.
+      const separator = reasoning.length ? '\n\n' : '';
+      const routed = separator + out;
+      reasoning += routed;
+      routedOutputToReasoning = true;
+      sse({
+        type: 'response.reasoning_text.delta',
+        item_id: msgId,
+        output_index: OUTPUT_INDEX,
+        content_index: CONTENT_INDEX,
+        delta: routed,
+      });
+    }
 
   // done events
-  if (reasoning.length) {
+  if (reasoning.length && (!SUPPRESS_REASONING_TEXT || routedOutputToReasoning)) {
     sse({
       type: 'response.reasoning_text.done',
       item_id: msgId,
@@ -951,7 +967,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   }
 
   const msgContent = [];
-  if (reasoning.length) {
+  if (reasoning.length && (!SUPPRESS_REASONING_TEXT || routedOutputToReasoning)) {
     msgContent.push({ type: 'reasoning_text', text: reasoning, annotations: [] });
   }
   if (includeOutputText) {
