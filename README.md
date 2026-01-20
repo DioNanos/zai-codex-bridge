@@ -114,8 +114,8 @@ Important:
   - Chat `tool_calls` (stream/non-stream) → Responses function-call events
   - Responses `function_call_output` → Chat `role=tool` messages
 - Non-function tool types are dropped for Z.AI compatibility.
-- Function calls are emitted as stream events; final `response.completed` output includes only message items
-  so Codex can execute tools locally.
+- Function calls are emitted as stream events; final `response.completed` output includes message + function_call
+  items in creation order for parity with streaming.
 
 (See repo changelog and docs for the exact implemented behavior.)
 
@@ -246,7 +246,7 @@ codex-with-zai -m "GLM-4.7"
   (and `reasoning_effort` when `reasoning.effort` is set).
 - Upstream reasoning text is accepted from any of: `reasoning_content`, `reasoning`, `thinking`, `thought`.
 - The proxy emits `response.reasoning_text.delta` / `response.reasoning_text.done` events and includes
-  `reasoning_text` content in the final Responses message.
+  `reasoning_text` content as a dedicated `reasoning` output item in `response.completed`.
 
 ## Troubleshooting
 
@@ -278,7 +278,7 @@ codex-with-zai -m "GLM-4.7"
 This repo includes end-to-end validation assets for running Codex through the proxy:
 
 - **Test suite:** [`CODEX_TEST_SUITE.md`](./CODEX_TEST_SUITE.md)
-- **Latest report:** [`CODEX_REPORT_v0.4.8.md`](./CODEX_REPORT_v0.4.8.md)
+- **Latest report:** [`CODEX_REPORT_v0.4.9.md`](./CODEX_REPORT_v0.4.9.md)
 
 Notes:
 - Interactive runs require a real TTY (`codex`).

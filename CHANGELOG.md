@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Separate reasoning output items with content-part events (aligns with Responses API)
+- Usage propagation from upstream streaming chunks when available
+
+### Changed
+- Output indices now follow creation order across message/reasoning/tool items
+- response.completed now preserves tool-call items in non-streaming mode for parity with streaming
+- response objects now inherit instructions/metadata/tool_choice/temperature/top_p from requests
+
+### Fixed
+- Avoid empty message items when tool-only rounds are suppressed
+
 ## [0.4.8] - 2026-01-19
 
 ### Added
