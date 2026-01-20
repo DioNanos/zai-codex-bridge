@@ -19,6 +19,10 @@ For each test:
 3. Report: ✅ PASS or ❌ FAIL with error details
 4. Continue to next test regardless of failures
 
+**Shell requirement (IMPORTANT)**:
+- Use **zsh** for all shell commands so `.zshrc` aliases are available (e.g. `codex-glm-a`).
+- Preferred pattern: `zsh -lc "<command>"` (not `bash -lc`).
+
 At the end, provide a summary report with:
 - Total tests: X
 - Passed: Y
