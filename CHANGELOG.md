@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-01-20
+
 ### Added
 - Separate reasoning output items with content-part events (aligns with Responses API)
 - Usage propagation from upstream streaming chunks when available
