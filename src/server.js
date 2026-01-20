@@ -24,6 +24,7 @@ const LOG_STREAM_MAX = parseInt(process.env.LOG_STREAM_MAX || '800', 10);
 const SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS = process.env.SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS === '1';
 const DEFER_OUTPUT_TEXT_UNTIL_DONE = process.env.DEFER_OUTPUT_TEXT_UNTIL_DONE === '1';
 const SUPPRESS_REASONING_TEXT = process.env.SUPPRESS_REASONING_TEXT === '1';
+const ALLOW_MULTI_TOOL_CALLS = process.env.ALLOW_MULTI_TOOL_CALLS === '1';
 
 // Env toggles for compatibility
 const ALLOW_SYSTEM = process.env.ALLOW_SYSTEM === '1';
@@ -38,6 +39,14 @@ function nowSec() {
  */
 function generateRequestId() {
   return `req_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+}
+
+function createSseEmitter(writeFn) {
+  let seq = 1;
+  return (obj) => {
+    if (obj.sequence_number == null) obj.sequence_number = seq++;
+    writeFn(obj);
+  };
 }
 
 /**
@@ -285,7 +294,7 @@ function computeDelta(prev, incoming) {
 /**
  * Translate Responses format to Chat Completions format
  */
-function translateResponsesToChat(request, allowTools) {
+function translateResponsesToChat(request, allowTools, options = {}) {
   const messages = [];
 
   // Add system message from instructions (with ALLOW_SYSTEM toggle)
@@ -380,7 +389,7 @@ function translateResponsesToChat(request, allowTools) {
   const chatRequest = {
     model: model,
     messages: messages,
-    stream: request.stream !== false // default true
+    stream: options.forceStream ? true : (request.stream !== false) // default true
   };
 
   // Pass through reasoning controls when present (provider may ignore unknown fields)
@@ -593,7 +602,9 @@ async function makeUpstreamRequest(path, body, headers) {
  * Handle streaming response from Z.AI with proper Responses API event format
  * Separates reasoning_content, content, and tool_calls into distinct events
  */
-async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, allowTools) {
+async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowTools, writer = {}) {
+  const emit = writer.emit || createSseEmitter(() => {});
+  const end = writer.end || (() => {});
   const decoder = new TextDecoder();
   const reader = upstreamBody.getReader();
   let buffer = '';
@@ -603,7 +614,6 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   const msgId = ids.msgId;
   const model = responsesRequest?.model || DEFAULT_MODEL;
 
-  let seq = 1;
   const OUTPUT_INDEX = 0;
   const CONTENT_INDEX = 0;
 
@@ -611,18 +621,19 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   let streamTerminated = false;
 
   function sse(obj) {
-    if (obj.sequence_number == null) obj.sequence_number = seq++;
-    res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    emit(obj);
   }
 
   /**
    * Send response.failed SSE event and safely close the stream
    */
+  let failedResponse = null;
   function sendResponseFailed(errorCode, errorMessage) {
     if (streamTerminated) return;
     streamTerminated = true;
 
     const failedEvent = buildResponseFailed(responseId, model, createdAt, errorCode, errorMessage);
+    failedResponse = failedEvent.response;
     sse(failedEvent);
     try {
       const cancel = reader.cancel();
@@ -633,9 +644,9 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
       // Ignore errors during reader cancel
     }
     try {
-      res.end();
+      end();
     } catch {
-      // Ignore errors during res.end()
+      // Ignore errors during end
     }
   }
 
@@ -707,6 +718,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
       output_index: tcData.outputIndex,
       item: fnItemDone,
     });
+    tcData.completedItem = fnItemDone;
     tcData.done = true;
   }
 
@@ -755,7 +767,7 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
               'content_filter',
               'Content was filtered by upstream provider'
             );
-            return; // Exit the loop entirely
+            return failedResponse; // Exit the loop entirely
           }
         }
 
@@ -764,7 +776,12 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
           if (SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS) {
             sawToolCalls = true;
           }
-          for (const tc of delta.tool_calls) {
+          const toolCalls = delta.tool_calls;
+          if (!ALLOW_MULTI_TOOL_CALLS && toolCalls.length > 1) {
+            log('warn', `Multiple tool_calls received (${toolCalls.length}); only the first will be processed`);
+          }
+          const toolCallsToProcess = ALLOW_MULTI_TOOL_CALLS ? toolCalls : toolCalls.slice(0, 1);
+          for (const tc of toolCallsToProcess) {
             let index = tc.index;
             const tcId = tc.id;
 
@@ -900,12 +917,12 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     // Exception occurred during streaming - send response.failed
     log('error', 'Stream exception:', streamError);
     sendResponseFailed('stream_error', `Stream processing error: ${streamError.message}`);
-    return;
+    return failedResponse;
   }
 
   // If stream was terminated due to content_filter or error, don't send completion events
   if (streamTerminated) {
-    return;
+    return failedResponse;
   }
 
   // Ensure any pending tool calls are finalized once at end of stream
@@ -988,10 +1005,14 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
     item: msgItemDone,
   });
 
-  // Build final output array: message item (if any) + any function_call items
-  const finalOutput = [];
-  if (msgContent.length > 0 || toolCallsMap.size === 0) {
-    finalOutput.push(msgItemDone);
+  // Build final output array: always include message item, then any function_call items
+  const finalOutput = [msgItemDone];
+  if (toolCallsMap.size > 0) {
+    const toolItems = Array.from(toolCallsMap.values())
+      .filter(tc => tc.completedItem)
+      .sort((a, b) => a.outputIndex - b.outputIndex)
+      .map(tc => tc.completedItem);
+    finalOutput.push(...toolItems);
   }
 
   const completed = buildResponseObject({
@@ -1006,9 +1027,14 @@ async function streamChatToResponses(upstreamBody, res, responsesRequest, ids, a
   });
 
   sse({ type: 'response.completed', response: completed });
-  res.end();
+  try {
+    end();
+  } catch {
+    // Ignore errors during end
+  }
 
   log('info', `Stream completed - ${out.length} output, ${reasoning.length} reasoning, ${toolCallsMap.size} tool_calls`);
+  return completed;
 }
 
 /**
@@ -1080,15 +1106,18 @@ async function handlePostRequest(req, res) {
   }
 
   let upstreamBody;
+  const clientWantsStream = (format === 'responses')
+    ? (request.stream !== false)
+    : (request.stream === true);
 
   // format is already defined above during validation
 
   if (format === 'responses') {
-    // Translate Responses to Chat
-    upstreamBody = translateResponsesToChat(request, allowTools);
+    // Translate Responses to Chat (force upstream streaming for unified handling)
+    upstreamBody = translateResponsesToChat(request, allowTools, { forceStream: true });
   } else if (format === 'chat') {
-    // Pass through Chat format
-    upstreamBody = request;
+    // Pass through Chat format (force upstream streaming for unified handling)
+    upstreamBody = { ...request, stream: true };
   } else {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Unknown request format' }));
@@ -1111,7 +1140,7 @@ async function handlePostRequest(req, res) {
       });
 
       // For streaming requests, send SSE response.failed
-      if (upstreamBody.stream) {
+      if (clientWantsStream) {
         const ids = {
           createdAt: nowSec(),
           responseId: `resp_${randomUUID().replace(/-/g, '')}`,
@@ -1132,8 +1161,10 @@ async function handlePostRequest(req, res) {
           'upstream_error',
           `Upstream request failed with status ${status}: ${errorBody.substring(0, 100)}`
         );
-        failedEvent.sequence_number = 1;
-        res.write(`data: ${JSON.stringify(failedEvent)}\n\n`);
+        const emit = createSseEmitter((obj) => {
+          res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        });
+        emit(failedEvent);
         res.end();
         return;
       }
@@ -1149,7 +1180,7 @@ async function handlePostRequest(req, res) {
     }
 
     // Handle streaming response
-    if (upstreamBody.stream) {
+    if (clientWantsStream) {
       const ids = {
         createdAt: nowSec(),
         responseId: `resp_${randomUUID().replace(/-/g, '')}`,
@@ -1164,23 +1195,41 @@ async function handlePostRequest(req, res) {
       });
 
       try {
-        await streamChatToResponses(upstreamResponse.body, res, request, ids, allowTools);
+        const emit = createSseEmitter((obj) => {
+          res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        });
+        await streamChatToResponses(
+          upstreamResponse.body,
+          request,
+          ids,
+          allowTools,
+          { emit, end: () => res.end() }
+        );
         log('info', 'Streaming completed');
       } catch (e) {
         log('error', 'Streaming error:', e);
       }
     } else {
-      // Non-streaming response
-      const chatResponse = await upstreamResponse.json();
-
+      // Non-streaming response (stream-first upstream)
       const ids = {
         createdAt: nowSec(),
         responseId: `resp_${randomUUID().replace(/-/g, '')}`,
         msgId: `msg_${randomUUID().replace(/-/g, '')}`,
       };
 
-      const response = translateChatToResponses(chatResponse, request, ids, allowTools);
-
+      const emit = createSseEmitter(() => {});
+      const response = await streamChatToResponses(
+        upstreamResponse.body,
+        request,
+        ids,
+        allowTools,
+        { emit, end: () => {} }
+      );
+      if (!response) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Stream processing failed' }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(response));
     }
