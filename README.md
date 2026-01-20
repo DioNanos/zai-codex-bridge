@@ -147,10 +147,13 @@ export HOST=127.0.0.1
 export PORT=31415
 export ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4
 export LOG_LEVEL=info
+export ZAI_API_KEY=your-zai-api-key   # or ZAI_API_KEY_P / ZAI_API_KEY_A
 
 # Optional
 export ALLOW_TOOLS=1   # force tool bridging (otherwise auto-enabled when tools are present)
 export ALLOW_SYSTEM=1  # only if your provider supports system role
+export SUPPRESS_REASONING_TEXT=1  # reduce latency by skipping reasoning stream
+export ALLOW_MULTI_TOOL_CALLS=1   # process multiple tool_calls in one chunk (default: first only)
 ```
 
 ---
