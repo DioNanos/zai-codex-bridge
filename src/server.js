@@ -87,20 +87,37 @@ function validateRequest(request, format) {
 /**
  * Build a response.failed SSE event
  */
-function buildResponseFailed(responseId, model, createdAt, errorCode, errorMessage) {
+function buildResponseFailed({
+  responseId,
+  model,
+  createdAt,
+  errorCode,
+  errorMessage,
+  responsesRequest = null,
+  input = [],
+  tools = [],
+  usage = null,
+}) {
+  const response = buildResponseObject({
+    id: responseId,
+    model,
+    status: 'failed',
+    created_at: createdAt,
+    completed_at: null,
+    input: input || responsesRequest?.input || [],
+    output: [],
+    tools: tools || responsesRequest?.tools || [],
+    request: responsesRequest || null,
+    usage,
+    error: {
+      code: errorCode,
+      message: errorMessage,
+    },
+  });
+
   return {
     type: 'response.failed',
-    response: {
-      id: responseId,
-      object: 'response',
-      created_at: createdAt,
-      status: 'failed',
-      model: model,
-      error: {
-        code: errorCode,
-        message: errorMessage
-      }
-    }
+    response,
   };
 }
 
@@ -113,7 +130,20 @@ function buildResponseObject({
   input = [],
   output = [],
   tools = [],
+  request = null,
+  usage = null,
+  error = null,
 }) {
+  const instructions = request?.instructions ?? null;
+  const max_output_tokens = request?.max_output_tokens ?? null;
+  const metadata = request?.metadata ?? {};
+  const text = request?.text ?? { format: { type: 'text' } };
+  const tool_choice = request?.tool_choice ?? 'auto';
+  const temperature = request?.temperature ?? 1;
+  const top_p = request?.top_p ?? 1;
+  const user = request?.user ?? null;
+  const reasoning_effort = request?.reasoning?.effort ?? null;
+
   // Struttura compatibile con Responses API per Codex CLI
   return {
     id,
@@ -121,25 +151,25 @@ function buildResponseObject({
     created_at,
     status,
     completed_at,
-    error: null,
+    error,
     incomplete_details: null,
     input,
-    instructions: null,
-    max_output_tokens: null,
+    instructions,
+    max_output_tokens,
     model,
     output,
     previous_response_id: null,
-    reasoning_effort: null,
+    reasoning_effort,
     store: false,
-    temperature: 1,
-    text: { format: { type: 'text' } },
-    tool_choice: 'auto',
+    temperature,
+    text,
+    tool_choice,
     tools,
-    top_p: 1,
+    top_p,
     truncation: 'disabled',
-    usage: null,
-    user: null,
-    metadata: {},
+    usage,
+    user,
+    metadata,
   };
 }
 
@@ -477,16 +507,13 @@ function translateResponsesToChat(request, allowTools, options = {}) {
 function translateChatToResponses(chatResponse, responsesRequest, ids, allowTools) {
   const msg = chatResponse.choices?.[0]?.message ?? {};
   const outputText = msg.content ?? '';
-  const reasoningText = extractReasoningText(msg);
+  const reasoningText = SUPPRESS_REASONING_TEXT ? '' : extractReasoningText(msg);
 
   const createdAt = ids?.createdAt ?? nowSec();
   const responseId = ids?.responseId ?? `resp_${randomUUID().replace(/-/g, '')}`;
   const msgId = ids?.msgId ?? `msg_${randomUUID().replace(/-/g, '')}`;
 
   const content = [];
-  if (reasoningText) {
-    content.push({ type: 'reasoning_text', text: reasoningText, annotations: [] });
-  }
   if (outputText) {
     content.push({ type: 'output_text', text: outputText, annotations: [] });
   }
@@ -499,8 +526,18 @@ function translateChatToResponses(chatResponse, responsesRequest, ids, allowTool
     content,
   };
 
-  // Build output array: message item (if any) + any function_call items
+  // Build output array: reasoning item (if any) + message item (if any) + tool calls
   const finalOutput = [];
+
+  if (reasoningText) {
+    finalOutput.push({
+      id: `rs_${randomUUID().replace(/-/g, '')}`,
+      type: 'reasoning',
+      status: 'completed',
+      content: [{ type: 'reasoning_text', text: reasoningText }],
+      summary: [],
+    });
+  }
 
   const hasToolCalls = allowTools && msg.tool_calls && Array.isArray(msg.tool_calls);
   if (content.length > 0 || !hasToolCalls) {
@@ -516,6 +553,14 @@ function translateChatToResponses(chatResponse, responsesRequest, ids, allowTool
 
       // Enhanced logging for FunctionCall debugging
       log('info', `FunctionCall: ${name}(${callId}) args_length=${args.length}`);
+
+      finalOutput.push({
+        id: callId,
+        type: 'function_call',
+        call_id: callId,
+        name,
+        arguments: args,
+      });
     }
   }
 
@@ -528,6 +573,7 @@ function translateChatToResponses(chatResponse, responsesRequest, ids, allowTool
     input: responsesRequest?.input || [],
     output: finalOutput,
     tools: responsesRequest?.tools || [],
+    request: responsesRequest || null,
   });
 }
 
@@ -614,11 +660,14 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
   const msgId = ids.msgId;
   const model = responsesRequest?.model || DEFAULT_MODEL;
 
-  const OUTPUT_INDEX = 0;
   const CONTENT_INDEX = 0;
+  const outputItems = [];
+  let currentTextItem = null;
+  let messageCount = 0;
 
   // Track if stream has been terminated to avoid double-end
   let streamTerminated = false;
+  let responseUsage = null;
 
   function sse(obj) {
     emit(obj);
@@ -632,7 +681,17 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
     if (streamTerminated) return;
     streamTerminated = true;
 
-    const failedEvent = buildResponseFailed(responseId, model, createdAt, errorCode, errorMessage);
+    const failedEvent = buildResponseFailed({
+      responseId,
+      model,
+      createdAt,
+      errorCode,
+      errorMessage,
+      responsesRequest,
+      input: responsesRequest?.input || [],
+      tools: responsesRequest?.tools || [],
+      usage: responseUsage,
+    });
     failedResponse = failedEvent.response;
     sse(failedEvent);
     try {
@@ -660,39 +719,185 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
     input: responsesRequest?.input || [],
     output: [],
     tools: responsesRequest?.tools || [],
+    request: responsesRequest || null,
   });
 
   sse({ type: 'response.created', response: baseResp });
   sse({ type: 'response.in_progress', response: baseResp });
 
-  // output_item.added + content_part.added (output_text)
-  const msgItemInProgress = {
-    id: msgId,
-    type: 'message',
-    status: 'in_progress',
-    role: 'assistant',
-    content: [],
-  };
-
-  sse({
-    type: 'response.output_item.added',
-    output_index: OUTPUT_INDEX,
-    item: msgItemInProgress,
-  });
-
-  // content_part.added emitted only if we receive output_text
-  let contentPartAdded = false;
-
-  let out = '';
-  let reasoning = '';
-  let routedOutputToReasoning = false;
+  let allOutputText = '';
+  let allReasoningText = '';
   let sawToolCalls = false;
   let lastFinishReason = null;
+
+  function addOutputItem(item) {
+    outputItems.push(item);
+    return outputItems.length - 1;
+  }
+
+  function startTextItem(kind, forceReasoning = false) {
+    if (kind === 'reasoning' && SUPPRESS_REASONING_TEXT && !forceReasoning) {
+      return null;
+    }
+    if (currentTextItem && currentTextItem.type === kind && !currentTextItem.closed) {
+      return currentTextItem;
+    }
+    if (currentTextItem && !currentTextItem.closed) {
+      closeTextItem(currentTextItem);
+    }
+
+    let id;
+    let item;
+    if (kind === 'message') {
+      id = messageCount === 0 ? msgId : `msg_${randomUUID().replace(/-/g, '')}`;
+      messageCount += 1;
+      item = {
+        id,
+        type: 'message',
+        status: 'in_progress',
+        role: 'assistant',
+        content: [],
+      };
+    } else {
+      id = `rs_${randomUUID().replace(/-/g, '')}`;
+      item = {
+        id,
+        type: 'reasoning',
+        status: 'in_progress',
+        content: [],
+        summary: [],
+      };
+    }
+
+    const outputIndex = addOutputItem(item);
+    sse({
+      type: 'response.output_item.added',
+      output_index: outputIndex,
+      item,
+    });
+
+    currentTextItem = {
+      type: kind,
+      id,
+      outputIndex,
+      text: '',
+      contentAdded: false,
+      closed: false,
+      forced: forceReasoning,
+    };
+    return currentTextItem;
+  }
+
+  function ensureContentPart(itemState) {
+    if (!itemState || itemState.contentAdded) return;
+    const part =
+      itemState.type === 'message'
+        ? { type: 'output_text', text: '', annotations: [] }
+        : { type: 'reasoning_text', text: '' };
+
+    sse({
+      type: 'response.content_part.added',
+      item_id: itemState.id,
+      output_index: itemState.outputIndex,
+      content_index: CONTENT_INDEX,
+      part,
+    });
+    itemState.contentAdded = true;
+  }
+
+  function closeTextItem(itemState, options = {}) {
+    if (!itemState || itemState.closed) return;
+
+    if (itemState.type === 'message') {
+      const allowOutputText = options.allowOutputText !== false;
+      if (allowOutputText && itemState.text.length) {
+        if (!itemState.contentAdded) {
+          ensureContentPart(itemState);
+        }
+        sse({
+          type: 'response.output_text.done',
+          item_id: itemState.id,
+          output_index: itemState.outputIndex,
+          content_index: CONTENT_INDEX,
+          text: itemState.text,
+        });
+        if (itemState.contentAdded) {
+          sse({
+            type: 'response.content_part.done',
+            item_id: itemState.id,
+            output_index: itemState.outputIndex,
+            content_index: CONTENT_INDEX,
+            part: { type: 'output_text', text: itemState.text, annotations: [] },
+          });
+        }
+      }
+
+      const msgItemDone = {
+        id: itemState.id,
+        type: 'message',
+        status: 'completed',
+        role: 'assistant',
+        content:
+          allowOutputText && itemState.text.length
+            ? [{ type: 'output_text', text: itemState.text, annotations: [] }]
+            : [],
+      };
+
+      sse({
+        type: 'response.output_item.done',
+        output_index: itemState.outputIndex,
+        item: msgItemDone,
+      });
+      outputItems[itemState.outputIndex] = msgItemDone;
+    } else {
+      const allowReasoningText = !SUPPRESS_REASONING_TEXT || itemState.forced;
+      if (allowReasoningText && itemState.text.length) {
+        if (!itemState.contentAdded) {
+          ensureContentPart(itemState);
+        }
+        sse({
+          type: 'response.reasoning_text.done',
+          item_id: itemState.id,
+          output_index: itemState.outputIndex,
+          content_index: CONTENT_INDEX,
+          text: itemState.text,
+        });
+        if (itemState.contentAdded) {
+          sse({
+            type: 'response.content_part.done',
+            item_id: itemState.id,
+            output_index: itemState.outputIndex,
+            content_index: CONTENT_INDEX,
+            part: { type: 'reasoning_text', text: itemState.text },
+          });
+        }
+      }
+
+      const reasoningItemDone = {
+        id: itemState.id,
+        type: 'reasoning',
+        status: 'completed',
+        content: allowReasoningText && itemState.text.length ? [{ type: 'reasoning_text', text: itemState.text }] : [],
+        summary: [],
+      };
+
+      sse({
+        type: 'response.output_item.done',
+        output_index: itemState.outputIndex,
+        item: reasoningItemDone,
+      });
+      outputItems[itemState.outputIndex] = reasoningItemDone;
+    }
+
+    itemState.closed = true;
+    if (currentTextItem === itemState) {
+      currentTextItem = null;
+    }
+  }
 
   // Tool call tracking (only if allowTools)
   const toolCallsMap = new Map(); // index -> { callId, name, outputIndex, arguments, partialArgs, done }
   const toolCallsById = new Map(); // callId -> index
-  const TOOL_BASE_INDEX = 1; // After message item
   let nextToolIndex = 0;
 
   function finalizeToolCall(tcData) {
@@ -719,6 +924,7 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
       item: fnItemDone,
     });
     tcData.completedItem = fnItemDone;
+    outputItems[tcData.outputIndex] = fnItemDone;
     tcData.done = true;
   }
 
@@ -757,6 +963,24 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
         const choice = chunk.choices?.[0] || {};
         const delta = choice.delta || {};
         const finishReason = choice.finish_reason;
+
+        if (chunk.usage) {
+          const usage = chunk.usage || {};
+          const promptTokens = usage.prompt_tokens ?? usage.input_tokens ?? 0;
+          const completionTokens = usage.completion_tokens ?? usage.output_tokens ?? 0;
+          const totalTokens = usage.total_tokens ?? (promptTokens + completionTokens);
+          const reasoningTokens =
+            usage.reasoning_tokens ??
+            usage.output_tokens_details?.reasoning_tokens ??
+            0;
+          responseUsage = {
+            input_tokens: promptTokens,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens: completionTokens,
+            output_tokens_details: { reasoning_tokens: reasoningTokens },
+            total_tokens: totalTokens,
+          };
+        }
 
         if (finishReason) {
           lastFinishReason = finishReason;
@@ -799,7 +1023,15 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
               // New tool call - send output_item.added
               const callId = tcId || `call_${randomUUID().replace(/-/g, '')}`;
               const name = tc.function?.name || '';
-              const outputIndex = TOOL_BASE_INDEX + index;
+              const fnItemInProgress = {
+                id: callId,
+                type: 'function_call',
+                call_id: callId,
+                name: name,
+                arguments: '',
+              };
+
+              const outputIndex = addOutputItem(fnItemInProgress);
 
               toolCallsMap.set(index, {
                 callId,
@@ -810,14 +1042,6 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
                 done: false
               });
               if (callId) toolCallsById.set(callId, index);
-
-              const fnItemInProgress = {
-                id: callId,
-                type: 'function_call',
-                call_id: callId,
-                name: name,
-                arguments: '',
-              };
 
               sse({
                 type: 'response.output_item.added',
@@ -871,43 +1095,49 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
 
         // NON mescolare reasoning in output_text
         const reasoningDelta = extractReasoningText(delta);
-        if (!SUPPRESS_REASONING_TEXT && reasoningDelta) {
-          const computed = computeDelta(reasoning, reasoningDelta);
-          reasoning = computed.next;
+        if (reasoningDelta) {
+          const computed = computeDelta(allReasoningText, reasoningDelta);
+          allReasoningText = computed.next;
           if (computed.delta.length) {
-            sse({
-              type: 'response.reasoning_text.delta',
-              item_id: msgId,
-              output_index: OUTPUT_INDEX,
-              content_index: CONTENT_INDEX,
-              delta: computed.delta,
-            });
+            const reasoningItem = startTextItem('reasoning');
+            if (reasoningItem) {
+              reasoningItem.text += computed.delta;
+              if (!reasoningItem.contentAdded) {
+                ensureContentPart(reasoningItem);
+              }
+              sse({
+                type: 'response.reasoning_text.delta',
+                item_id: reasoningItem.id,
+                output_index: reasoningItem.outputIndex,
+                content_index: CONTENT_INDEX,
+                delta: computed.delta,
+              });
+            }
           }
         }
 
         if (typeof delta.content === 'string' && delta.content.length) {
-          const computed = computeDelta(out, delta.content);
-          out = computed.next;
-          if (!DEFER_OUTPUT_TEXT_UNTIL_DONE
-            && !(SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS && sawToolCalls)
-            && computed.delta.length) {
-            if (!contentPartAdded) {
-              sse({
-                type: 'response.content_part.added',
-                item_id: msgId,
-                output_index: OUTPUT_INDEX,
-                content_index: CONTENT_INDEX,
-                part: { type: 'output_text', text: '', annotations: [] },
-              });
-              contentPartAdded = true;
+          const computed = computeDelta(allOutputText, delta.content);
+          allOutputText = computed.next;
+          if (computed.delta.length) {
+            const msgItem = startTextItem('message');
+            if (msgItem) {
+              msgItem.text += computed.delta;
+              const emitOutputText = !DEFER_OUTPUT_TEXT_UNTIL_DONE
+                && !(SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS && sawToolCalls);
+              if (emitOutputText) {
+                if (!msgItem.contentAdded) {
+                  ensureContentPart(msgItem);
+                }
+                sse({
+                  type: 'response.output_text.delta',
+                  item_id: msgItem.id,
+                  output_index: msgItem.outputIndex,
+                  content_index: CONTENT_INDEX,
+                  delta: computed.delta,
+                });
+              }
             }
-            sse({
-              type: 'response.output_text.delta',
-              item_id: msgId,
-              output_index: OUTPUT_INDEX,
-              content_index: CONTENT_INDEX,
-              delta: computed.delta,
-            });
           }
         }
       }
@@ -935,84 +1165,46 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
   const suppressForTools = SUPPRESS_ASSISTANT_TEXT_WHEN_TOOLS
     && sawToolCalls
     && lastFinishReason === 'tool_calls';
-  const includeOutputText = out.length > 0 && !suppressForTools;
-    if (!includeOutputText && out.length > 0) {
-      log('info', 'Suppressing assistant output_text due to tool_calls', { finish_reason: lastFinishReason });
-      // Route suppressed assistant text into reasoning stream so it is visible outside chat.
-      const separator = reasoning.length ? '\n\n' : '';
-      const routed = separator + out;
-      reasoning += routed;
-      routedOutputToReasoning = true;
+  const includeOutputText = allOutputText.length > 0 && !suppressForTools;
+
+  if (suppressForTools && allOutputText.length > 0) {
+    log('info', 'Suppressing assistant output_text due to tool_calls', { finish_reason: lastFinishReason });
+    // Route suppressed assistant text into reasoning stream so it is visible outside chat.
+    const separator = allReasoningText.length ? '\n\n' : '';
+    const routed = separator + allOutputText;
+    allReasoningText += routed;
+    if (currentTextItem && currentTextItem.type === 'message' && !currentTextItem.closed) {
+      closeTextItem(currentTextItem, { allowOutputText: false });
+    }
+    const reasoningItem = startTextItem('reasoning', true);
+    if (reasoningItem) {
+      reasoningItem.text += routed;
+      if (!reasoningItem.contentAdded) {
+        ensureContentPart(reasoningItem);
+      }
       sse({
         type: 'response.reasoning_text.delta',
-        item_id: msgId,
-        output_index: OUTPUT_INDEX,
+        item_id: reasoningItem.id,
+        output_index: reasoningItem.outputIndex,
         content_index: CONTENT_INDEX,
         delta: routed,
       });
     }
-
-  // done events
-  if (reasoning.length && (!SUPPRESS_REASONING_TEXT || routedOutputToReasoning)) {
-    sse({
-      type: 'response.reasoning_text.done',
-      item_id: msgId,
-      output_index: OUTPUT_INDEX,
-      content_index: CONTENT_INDEX,
-      text: reasoning,
-    });
   }
 
-  if (includeOutputText) {
-    sse({
-      type: 'response.output_text.done',
-      item_id: msgId,
-      output_index: OUTPUT_INDEX,
-      content_index: CONTENT_INDEX,
-      text: out,
-    });
-
-    if (contentPartAdded) {
-      sse({
-        type: 'response.content_part.done',
-        item_id: msgId,
-        output_index: OUTPUT_INDEX,
-        content_index: CONTENT_INDEX,
-        part: { type: 'output_text', text: out, annotations: [] },
-      });
+  if (currentTextItem && !currentTextItem.closed) {
+    if (currentTextItem.type === 'message') {
+      closeTextItem(currentTextItem, { allowOutputText: includeOutputText });
+    } else {
+      closeTextItem(currentTextItem);
     }
   }
 
-  const msgContent = [];
-  if (reasoning.length && (!SUPPRESS_REASONING_TEXT || routedOutputToReasoning)) {
-    msgContent.push({ type: 'reasoning_text', text: reasoning, annotations: [] });
-  }
-  if (includeOutputText) {
-    msgContent.push({ type: 'output_text', text: out, annotations: [] });
-  }
-
-  const msgItemDone = {
-    id: msgId,
-    type: 'message',
-    status: 'completed',
-    role: 'assistant',
-    content: msgContent,
-  };
-
-  sse({
-    type: 'response.output_item.done',
-    output_index: OUTPUT_INDEX,
-    item: msgItemDone,
-  });
-
-  // Build final output array: always include message item, then any function_call items
-  const finalOutput = [msgItemDone];
-  if (toolCallsMap.size > 0) {
-    const toolItems = Array.from(toolCallsMap.values())
-      .filter(tc => tc.completedItem)
-      .sort((a, b) => a.outputIndex - b.outputIndex)
-      .map(tc => tc.completedItem);
-    finalOutput.push(...toolItems);
+  let finalOutput = outputItems.filter(Boolean);
+  if (suppressForTools) {
+    finalOutput = finalOutput.filter(
+      item => !(item.type === 'message' && Array.isArray(item.content) && item.content.length === 0)
+    );
   }
 
   const completed = buildResponseObject({
@@ -1024,6 +1216,8 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
     input: responsesRequest?.input || [],
     output: finalOutput,
     tools: responsesRequest?.tools || [],
+    request: responsesRequest || null,
+    usage: responseUsage,
   });
 
   sse({ type: 'response.completed', response: completed });
@@ -1033,7 +1227,7 @@ async function streamChatToResponses(upstreamBody, responsesRequest, ids, allowT
     // Ignore errors during end
   }
 
-  log('info', `Stream completed - ${out.length} output, ${reasoning.length} reasoning, ${toolCallsMap.size} tool_calls`);
+  log('info', `Stream completed - ${allOutputText.length} output, ${allReasoningText.length} reasoning, ${toolCallsMap.size} tool_calls`);
   return completed;
 }
 
@@ -1154,13 +1348,16 @@ async function handlePostRequest(req, res) {
           'X-Accel-Buffering': 'no',
         });
 
-        const failedEvent = buildResponseFailed(
-          ids.responseId,
-          request.model || DEFAULT_MODEL,
-          ids.createdAt,
-          'upstream_error',
-          `Upstream request failed with status ${status}: ${errorBody.substring(0, 100)}`
-        );
+        const failedEvent = buildResponseFailed({
+          responseId: ids.responseId,
+          model: request.model || DEFAULT_MODEL,
+          createdAt: ids.createdAt,
+          errorCode: 'upstream_error',
+          errorMessage: `Upstream request failed with status ${status}: ${errorBody.substring(0, 100)}`,
+          responsesRequest: request,
+          input: request?.input || [],
+          tools: request?.tools || [],
+        });
         const emit = createSseEmitter((obj) => {
           res.write(`data: ${JSON.stringify(obj)}\n\n`);
         });
